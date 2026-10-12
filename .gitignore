@@ -24,3 +24,6 @@ Thumbs.db
 *.jsonl
 logs/
 *.tmp
+
+# 本地开发用的离线测试，不属于插件本体，不随插件发布。
+test_*.py
