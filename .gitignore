@@ -1,0 +1,26 @@
+# 运行时生成的插件配置：含群号、QQ 号与兑换码池，不要提交。
+# 宿主会在插件首次加载时按插件声明的默认配置自动生成该文件
+# （见 src/plugin_runtime/runner/runner_main.py 的 should_initialize_file），
+# 因此仓库里不需要携带它。
+config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# 工具与编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.jsonl
+logs/
+*.tmp

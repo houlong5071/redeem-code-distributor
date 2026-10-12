@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 40 40" fill="none">
+  <title>兑换码发放</title>
+  <desc>深石墨底上的一张浅色票券，中间虚线为撕口，右侧橙色圆点代表已核销。</desc>
+  <rect width="40" height="40" rx="8" fill="#1C272C"/>
+  <g stroke="#E4ECEE" stroke-width="1.75" stroke-linejoin="round">
+    <path d="M8 15.5a2 2 0 0 1 2-2h20a2 2 0 0 1 2 2v2.2a2.3 2.3 0 0 0 0 4.6v2.2a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-2.2a2.3 2.3 0 0 0 0-4.6z"/>
+    <path d="M24 14.5v11" stroke-dasharray="2.2 2.2"/>
+  </g>
+  <circle cx="29" cy="20" r="1.9" fill="#F08A24"/>
+</svg>

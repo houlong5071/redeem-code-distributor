@@ -1,0 +1,46 @@
+{
+  "manifest_version": 2,
+  "version": "1.2.0",
+  "name": "兑换码发放",
+  "description": "在指定群的指定成员触发关键词时，从其管理的兑换码池中随机发放一个未使用的兑换码，并记录使用时间。",
+  "author": {
+    "name": "houlong5071",
+    "url": "https://github.com/houlong5071"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/houlong5071/redeem-code-distributor",
+    "homepage": "https://github.com/houlong5071/redeem-code-distributor",
+    "documentation": "https://github.com/houlong5071/redeem-code-distributor#readme",
+    "issues": "https://github.com/houlong5071/redeem-code-distributor/issues"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "999.999.999"
+  },
+  "sdk": {
+    "min_version": "2.5.2",
+    "max_version": "999.999.999"
+  },
+  "dependencies": [],
+  "plugin_type": "tool",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.svg",
+      "fallback": "puzzle",
+      "background": "#1C272C"
+    }
+  },
+  "capabilities": [
+    "message.get_recent"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "houlong5071.redeem-code-distributor"
+}
