@@ -27,8 +27,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -52,8 +54,17 @@ MAX_USED_RECORDS = 1000
 # 「最近发言人」内存记录的最大会话数，超出后淘汰最旧的，避免长期运行下无限增长。
 MAX_RECENT_SPEAKERS = 512
 
+# 允许的「来自未来」的时间戳偏差（秒）。超出即视为时间不可信、保守拒绝。
+FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 30
+
 # 同进程内串行化「读改写 config.toml」，避免并发触发时互相覆盖。
 _CONFIG_WRITE_LOCK = threading.Lock()
+
+# 从已使用记录里抠出兑换码字段。记录形如
+# ``2026-10-09 21:30:00 | 码:"XXXX" | 群:123 | QQ:456``；
+# 兑换码用 JSON 字符串包裹（可含转义），因此即使码本身带 ``|`` 或 ``:`` 也能精确匹配。
+# 同时兼容未加引号的旧格式记录。
+_USED_CODE_RE = re.compile(r'\| 码:(?P<code>"(?:[^"\\]|\\.)*"|[^|]*?)\s*(?=\||$)')
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -270,6 +281,7 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
 
         components = super().get_components()
         hint_line = self._build_trigger_hint()
+        expose_status = bool(self.config.tool.expose_status_tool)
 
         # 深拷贝后再改：super().get_components() 返回的结构可能被 SDK 缓存复用，
         # 就地改写会污染 SDK 侧的状态（也可能影响其他插件看到的同一份对象）。
@@ -280,6 +292,12 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
                 continue
             item = copy.deepcopy(component)
             if item.get("type") == "TOOL":
+                # 关掉余量查询时直接把组件摘掉，而不是留着它「调用即报错」：
+                # 挂着一个永远失败的工具会白占大模型的工具列表，也可能诱导它去调。
+                # 注意这属于注册期行为，改动后需重载插件才生效。
+                if item.get("name") == "redeem_code_status" and not expose_status:
+                    del item
+                    continue
                 item["chat_scope"] = "group"
                 if hint_line and item.get("name") == "redeem_code_issue":
                     metadata = item.get("metadata")
@@ -570,16 +588,94 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         # 毫秒级时间戳兜底：换算成秒，避免被误判成「未来」。
         if value > 1e11:
             value /= 1000.0
-        return max(time.time() - value, 0.0)
+
+        age = time.time() - value
+        if age < -FUTURE_TIMESTAMP_TOLERANCE_SECONDS:
+            # 明显来自未来的时间戳：可能是格式误判或时钟有问题。直接当作不可读，
+            # 让调用方保守拒绝——否则「未来」会被 clamp 成 0 秒，恰好落进时间窗而
+            # 被当成「刚发的消息」放行。
+            return None
+        # 轻微的时钟漂移（几秒内）不算问题，一并归零。
+        return max(age, 0.0)
 
     # ===== 兑换码池维护 =====
 
     def _reload_pool_from_config(self) -> None:
-        """按当前配置重建内存中的兑换码池与已使用记录。"""
+        """按当前配置重建内存中的兑换码池与已使用记录。
 
-        self._available_codes = parse_code_lines(self.config.pool.available_codes)
-        self._used_records = [str(item).strip() for item in self.config.pool.used_codes if str(item).strip()]
+        这里加了一道**单调保护**，用来兜住「配置页陈旧保存」：管理员先打开配置页、
+        插件在这期间发放并写盘、管理员随后保存页面上的任意字段，如果宿主是按页面
+        里的旧模型整份写回，那么 ``available_codes`` 会连已发出的码一起回来、
+        ``used_codes`` 也会被旧值覆盖。照单全收的话「一个码只发一次」和发放记录
+        会同时报废，重载后同一个码还能再发一次。
+
+        保护规则有两条：
+        1. 已使用记录**只增不减**：新配置里的记录与内存里的求并集，绝不因为一次
+           陈旧保存而丢掉发放历史；
+        2. 待发放池**剔除**所有已出现在已使用记录里的码（含本次并集进来的），
+           因此即使旧模型把码写回了 ``available_codes``，它也复活不了。
+
+        代价是：管理员在配置页里**手动删掉**某条已使用记录并不会让那个码回到
+        待发放池。这是有意的——「一个码只发一次」比「能手工回收」更重要。
+        """
+
+        incoming_codes = parse_code_lines(self.config.pool.available_codes)
+        incoming_records = [str(item).strip() for item in self.config.pool.used_codes if str(item).strip()]
+
+        # 并集：内存里已有的记录排在前（它们在时间上更新），新来的补充在后。
+        merged_records = list(self._used_records)
+        for record in incoming_records:
+            if record not in merged_records:
+                merged_records.append(record)
+        if len(merged_records) > MAX_USED_RECORDS:
+            del merged_records[MAX_USED_RECORDS:]
+
+        used_codes = self._collect_used_codes(merged_records)
+        resurrected = [code for code in incoming_codes if code in used_codes]
+        available = [code for code in incoming_codes if code not in used_codes]
+
+        self._available_codes = available
+        self._used_records = merged_records
         self._last_written_codes_text = None
+
+        if resurrected:
+            logger.warning(
+                "配置里的兑换码池含有 %d 个已发放过的码，已剔除以免重复发放（可能是配置页陈旧保存）",
+                len(resurrected),
+            )
+
+    @staticmethod
+    def _collect_used_codes(records: List[str]) -> set[str]:
+        """从已使用记录里取出所有已发放的兑换码。
+
+        记录格式见 :meth:`_format_used_record`：``时间 | 码:"XXX" | 群:... | QQ:...``。
+        兑换码用 JSON 字符串包裹，因此即使码本身含 ``|`` 或 ``:`` 也能精确定位。
+        旧格式（未加引号）的记录也一并兼容，避免升级后老记录失去保护作用。
+
+        Args:
+            records: 已使用记录文本列表。
+
+        Returns:
+            set[str]: 已发放过的兑换码集合。
+        """
+
+        codes: set[str] = set()
+        for record in records:
+            match = _USED_CODE_RE.search(record)
+            if match is None:
+                continue
+            raw = match.group(1)
+            if raw.startswith('"'):
+                try:
+                    code = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+            else:
+                code = raw
+            code = str(code).strip()
+            if code:
+                codes.add(code)
+        return codes
 
     def _issue_one_code(self, group_id: str, user_id: str) -> Tuple[Optional[str], int, bool]:
         """随机取出一个未使用的兑换码并记录使用情况。
@@ -625,17 +721,21 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
     def _format_used_record(code: str, group_id: str, user_id: str) -> str:
         """生成一条已使用记录的展示文本。
 
+        兑换码用 JSON 字符串包裹（``json.dumps``），这样即使码本身含 ``|`` 或 ``:``
+        也仍能被 :data:`_USED_CODE_RE` 精确抠出来——否则按 ``|`` 切分会把码截断，
+        单调保护就会漏掉这个码，陈旧保存时它还能复活。旧格式记录同样被兼容。
+
         Args:
             code: 已发放的兑换码。
             group_id: 领用的群号。
             user_id: 领用的 QQ 号。
 
         Returns:
-            str: 形如 ``2026-10-09 21:30:00 | 码:XXX | 群:123 | QQ:456`` 的记录。
+            str: 形如 ``2026-10-09 21:30:00 | 码:"XXX" | 群:123 | QQ:456`` 的记录。
         """
 
         used_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return f"{used_at} | 码:{code} | 群:{group_id or '-'} | QQ:{user_id or '-'}"
+        return f"{used_at} | 码:{json.dumps(code, ensure_ascii=False)} | 群:{group_id or '-'} | QQ:{user_id or '-'}"
 
     def _persist_pool(self) -> bool:
         """把内存中的兑换码池写回插件自己的 config.toml。
