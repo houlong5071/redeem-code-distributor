@@ -174,6 +174,13 @@ class ToolConfig(PluginConfigBase):
         default=300,
         description="内存里记住的「最近发言人」有效期（秒），超时后改用数据库确认身份。",
     )
+    identity_fallback_window_seconds: int = Field(
+        default=90,
+        description="身份兜底时允许的「最近消息」时间窗（秒）。内存记录失效后，只有当该会话最后一条消息"
+        "足够新（说明多半就是本次请求）才认它的发送者，避免把群里上一个说话的人误认成请求者。"
+        "设为 0 表示禁用兜底，身份只认内存记录，认不出就保守拒绝。",
+        json_schema_extra={"hint": "0 = 禁用兜底，最安全；默认 90 秒"},
+    )
 
 
 class RedeemCodeConfig(PluginConfigBase):
@@ -409,8 +416,13 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
     async def _resolve_caller(self, session_id: str, group_id_hint: str) -> Optional[Tuple[str, str]]:
         """确认这次请求是谁在哪个群发起的。
 
-        群聊里工具拿不到发起人 QQ，所以先用观察型 Hook 留下的内存记录，再回退到
-        数据库：该会话最近一条消息的发送者通常就是本次请求者。
+        群聊里工具拿不到发起人 QQ，所以先用观察型 Hook 留下的内存记录；内存里没有
+        有效记录时（例如插件刚重启），再回退到数据库，但这时的依据是「该会话最后一
+        条消息的发送者」——它未必就是本次请求者。所以兜底必须加时间窗：只有当这条
+        消息足够新、与本次调用在时间上对得上时才采信，否则保守拒绝。
+
+        不加时间窗的后果是：群里管理员刚说过话（内存记录又恰好失效），紧接着某个
+        非管理员说一句「发个兑换码」，就会被认成管理员而领到码。
 
         群号则以宿主注入的 ``group_id_hint`` 为准——它来自当前会话，是最权威的；
         内存记录与数据库里的群号只是兜底。
@@ -428,6 +440,12 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if speaker is not None:
             recorded_group, user_id = speaker
             return (hint or recorded_group, user_id)
+
+        window = int(self.config.tool.identity_fallback_window_seconds)
+        if window <= 0:
+            # 兜底被显式关闭：身份只认内存记录。
+            logger.info("身份兜底已禁用且内存无有效记录，保守拒绝: session_id=%s", session_id)
+            return None
 
         try:
             limit = max(int(self.config.tool.recent_message_limit), 1)
@@ -452,12 +470,63 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
             user_id = str(user_info.get("user_id") or "").strip()
             if not user_id:
                 continue
+
+            # 时间窗校验：序列化后的 timestamp 是「秒级浮点时间戳的字符串」。
+            age = self._message_age_seconds(item.get("timestamp"))
+            if age is None or age > window:
+                logger.info(
+                    "身份兜底失败：会话最后一条消息已过期或时间不可读（age=%s，上限 %s 秒），保守拒绝 session_id=%s",
+                    "未知" if age is None else f"{age:.1f}",
+                    window,
+                    session_id,
+                )
+                return None
+
             group_info = info.get("group_info")
             group_id = ""
             if isinstance(group_info, dict):
                 group_id = str(group_info.get("group_id") or "").strip()
             return (group_id or group_id_hint, user_id)
         return None
+
+    @staticmethod
+    def _message_age_seconds(timestamp: Any) -> Optional[float]:
+        """把消息的 ``timestamp`` 换算成「距今多少秒」。
+
+        宿主序列化消息时把时间写成了秒级浮点时间戳的字符串（见
+        ``PluginMessageUtils._session_message_to_dict``），但字段类型在不同版本间
+        未必稳定，因此这里同时接受数字、数字字符串与可解析的文本时间。
+
+        Args:
+            timestamp: 消息里的 timestamp 字段。
+
+        Returns:
+            Optional[float]: 距今秒数；无法解析时返回 ``None``（调用方据此保守拒绝）。
+        """
+
+        if timestamp is None:
+            return None
+        try:
+            if isinstance(timestamp, (int, float)):
+                value = float(timestamp)
+            else:
+                text = str(timestamp).strip()
+                if not text:
+                    return None
+                try:
+                    value = float(text)
+                except ValueError:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    value = parsed.timestamp()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+        if value <= 0:
+            return None
+        # 毫秒级时间戳兜底：换算成秒，避免被误判成「未来」。
+        if value > 1e11:
+            value /= 1000.0
+        return max(time.time() - value, 0.0)
 
     # ===== 兑换码池维护 =====
 
@@ -468,23 +537,31 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         self._used_records = [str(item).strip() for item in self.config.pool.used_codes if str(item).strip()]
         self._last_written_codes_text = None
 
-    def _issue_one_code(self, group_id: str, user_id: str) -> Tuple[Optional[str], int]:
+    def _issue_one_code(self, group_id: str, user_id: str) -> Tuple[Optional[str], int, bool]:
         """随机取出一个未使用的兑换码并记录使用情况。
 
         取码与写盘在同一段同步逻辑里完成，期间没有 await，因此并发触发时
         不会把同一个兑换码发两次。
+
+        写盘成功才算发放成功。写盘失败时会把内存状态整体回滚到发放前的样子，
+        并让调用方拒绝发放——否则磁盘上的 ``available_codes`` 仍含这个码，
+        插件重载后会再发一次。
 
         Args:
             group_id: 领取人所在的群号。
             user_id: 领取人的 QQ 号。
 
         Returns:
-            Tuple[Optional[str], int]: 本次发出的兑换码（发完时为 ``None``）
-            以及发放后剩余的兑换码数量。
+            Tuple[Optional[str], int, bool]: 本次发出的兑换码（发完或写盘失败时为
+            ``None``）、发放后剩余的兑换码数量，以及是否发放成功。
         """
 
         if not self._available_codes:
-            return None, 0
+            return None, 0, False
+
+        # 记下发放前的状态，写盘失败时用于回滚。
+        previous_codes = list(self._available_codes)
+        previous_records = list(self._used_records)
 
         index = random.randrange(len(self._available_codes))
         code = self._available_codes.pop(index)
@@ -493,8 +570,12 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if len(self._used_records) > MAX_USED_RECORDS:
             del self._used_records[MAX_USED_RECORDS:]
 
-        self._persist_pool()
-        return code, len(self._available_codes)
+        if not self._persist_pool():
+            self._available_codes = previous_codes
+            self._used_records = previous_records
+            return None, len(self._available_codes), False
+
+        return code, len(self._available_codes), True
 
     @staticmethod
     def _format_used_record(code: str, group_id: str, user_id: str) -> str:
@@ -512,15 +593,21 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         used_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return f"{used_at} | 码:{code} | 群:{group_id or '-'} | QQ:{user_id or '-'}"
 
-    def _persist_pool(self) -> None:
+    def _persist_pool(self) -> bool:
         """把内存中的兑换码池写回插件自己的 config.toml。
 
-        以内存中的完整配置为骨架生成文档，再覆盖兑换码相关的两个字段，
-        因此无论配置文件是否已存在、是否缺少某个配置节，写回结果都是完整
-        且可再次加载的——尤其能保证 ``[plugin]`` 节不会丢失（缺少该节会
-        触发宿主的 ``PluginConfigVersionError`` 而使插件无法加载）。
+        优先在磁盘上已有的文档上就地改 ``[pool]`` 两个字段，这样用户在配置页里
+        写的注释与排版都能保住；只有在文件不存在或解析失败时，才退回「以内存中的
+        完整配置为骨架」重建整份文档——那条路径能保证写回结果完整且可再次加载，
+        尤其能保证 ``[plugin]`` 节不会丢失（缺少该节会触发宿主的
+        ``PluginConfigVersionError`` 而使插件无法加载）。
 
         按宿主约定不在插件目录创建任何临时文件。
+
+        Returns:
+            bool: 是否成功写盘。调用方必须据此决定要不要把兑换码发出去——写盘失败
+            却照样发码的话，磁盘上的 ``available_codes`` 还留着这个码，插件重载后
+            会把它再发一次，同一个码就发了两次。
         """
 
         codes_text = dump_code_lines(self._available_codes)
@@ -528,7 +615,7 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
 
         with _CONFIG_WRITE_LOCK:
             try:
-                document = tomlkit.parse(tomlkit.dumps(self.get_plugin_config_data()))
+                document = self._load_document_for_write(config_path)
                 pool_table = document.get("pool")
                 if pool_table is None:
                     pool_table = tomlkit.table()
@@ -540,9 +627,41 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
                     handle.write(tomlkit.dumps(document))
             except Exception:
                 logger.error("写回兑换码池到 %s 失败", config_path, exc_info=True)
-                return
+                return False
 
         self._last_written_codes_text = codes_text
+        return True
+
+    def _load_document_for_write(self, config_path: Path) -> Any:
+        """取用于写回的 TOML 文档：能读到现有文件就沿用它的格式。
+
+        宿主在某些时机可能会把配置里的键名规范化（例如下划线键），这类改写不影响
+        我们写入的两个字段，所以直接沿用磁盘上的文档是安全的——它同样是完整可加载
+        的。若文件不存在（插件首次发放、宿主尚未落盘）或内容已损坏到解析不了，再
+        退回用内存配置重建。
+
+        Args:
+            config_path: 插件配置文件路径。
+
+        Returns:
+            Any: tomlkit 文档对象。
+        """
+
+        try:
+            existing_text = config_path.read_text(encoding="utf-8")
+        except OSError:
+            existing_text = ""
+        except Exception:
+            logger.debug("读取 %s 失败，改用内存配置重建文档", config_path, exc_info=True)
+            existing_text = ""
+
+        if existing_text.strip():
+            try:
+                return tomlkit.parse(existing_text)
+            except Exception:
+                logger.warning("解析 %s 失败，改用内存配置重建文档", config_path, exc_info=True)
+
+        return tomlkit.parse(tomlkit.dumps(self.get_plugin_config_data()))
 
     # ===== 工具 =====
 
@@ -610,8 +729,17 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if user_id not in admin_whitelist:
             return {"success": False, "error": str(self.config.reply.no_permission_reply or "没有权限哦")}
 
-        code, remaining = self._issue_one_code(resolved_group_id, user_id)
-        if code is None:
+        code, remaining, issued = self._issue_one_code(resolved_group_id, user_id)
+        if not issued:
+            if code is not None:  # pragma: no cover - 失败路径下 code 恒为 None
+                logger.error("兑换码发放状态异常：写盘失败却带回了兑换码")
+            if self._available_codes:
+                # 池子里还有码，说明是写盘失败而不是发完了。
+                logger.error(
+                    "发放兑换码失败：兑换码池写盘未成功，已拒绝本次发放 session_id=%s",
+                    session_id,
+                )
+                return {"success": False, "error": "兑换码暂时发不出去，请稍后再试。"}
             return {"success": False, "error": str(self.config.reply.empty_reply or "我的钱包都已经空了")}
 
         logger.info(
@@ -625,18 +753,31 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
     @Tool(
         "redeem_code_status",
         description=(
-            "查询当前还有多少兑换码可发、以及最近发出去的兑换码记录。"
-            "当有人询问「还剩多少兑换码」「谁领过」时使用。"
-            "本工具不消耗兑换码。"
+            "查询当前还有多少兑换码可发。当有人询问「还剩多少兑换码」「兑换码还有吗」时使用。"
+            "本工具不消耗兑换码，只会返回一个数量。"
+            "本工具需要与领码相同的权限，无权限时会被回绝，届时把回绝文案原样转述即可。"
         ),
         parameters=[],
         visibility="visible",
     )
-    async def handle_code_status(self, **kwargs: Any) -> Dict[str, Any]:
-        """报告兑换码余量与最近使用记录。
+    async def handle_code_status(
+        self,
+        stream_id: str = "",
+        chat_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """报告兑换码余量。
+
+        权限校验与发码工具完全一致：先确认请求者身份，再校验群白名单与管理员
+        白名单。只返回数量，**不回显任何已发放的兑换码**——兑换码本身就是凭据，
+        回显等于把发出去的码再送一次，顺带泄露领取人的群号与 QQ。
 
         Args:
-            **kwargs: 宿主注入的参数（忽略）。
+            stream_id: 宿主注入的会话 ID。
+            chat_id: 宿主注入的会话 ID（与 ``stream_id`` 同义，兼容不同调用路径）。
+            group_id: 宿主注入的群号。
+            **kwargs: 其余参数（忽略）。
 
         Returns:
             Dict[str, Any]: 供宿主解析的工具结果。
@@ -647,13 +788,32 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if not self.config.tool.expose_status_tool:
             return {"success": False, "error": "当前未开放兑换码余量查询，请自然回绝对方。"}
 
+        if not self.config.plugin.enabled:
+            return {"success": False, "error": "兑换码功能当前未启用，请自然回绝对方。"}
+
+        session_id = str(stream_id or chat_id or "").strip()
+        if not session_id:
+            logger.warning("查询兑换码余量失败：本次调用没有 session_id")
+            return {"success": False, "error": "无法确定当前会话。"}
+
+        caller = await self._resolve_caller(session_id, str(group_id or "").strip())
+        if caller is None:
+            logger.warning("查询兑换码余量失败：无法确认请求者身份 session_id=%s", session_id)
+            return {"success": False, "error": "暂时无法确认你的身份，请稍后再试。"}
+
+        resolved_group_id, user_id = caller
+
+        group_whitelist = {str(item).strip() for item in self.config.access.group_whitelist if str(item).strip()}
+        if resolved_group_id not in group_whitelist:
+            return {"success": False, "error": "本群未开通该功能，请当作普通聊天回应，不要提及兑换码。"}
+
+        admin_whitelist = {str(item).strip() for item in self.config.access.admin_whitelist if str(item).strip()}
+        if user_id not in admin_whitelist:
+            return {"success": False, "error": str(self.config.reply.no_permission_reply or "没有权限哦")}
+
         remaining = len(self._available_codes)
-        recent = self._used_records[:5]
-        lines = [f"当前还有 {remaining} 个兑换码可发。"]
-        if recent:
-            lines.append("最近发放记录：")
-            lines.extend(f"- {item}" for item in recent)
-        return {"success": True, "content": "\n".join(lines)}
+        logger.info("已响应 QQ:%s（群:%s）的余量查询，剩余 %d 个", user_id, resolved_group_id, remaining)
+        return {"success": True, "content": f"当前还有 {remaining} 个兑换码可发。"}
 
     def _build_issue_content(self, code: str, remaining: int) -> str:
         """组合交给麦麦转述的发放文本。
