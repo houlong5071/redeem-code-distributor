@@ -92,12 +92,12 @@ class AccessConfig(PluginConfigBase):
     group_whitelist: list[str] = Field(
         default_factory=list,
         description="允许使用兑换码功能的群号；列表为空时任何群都不生效。",
-        json_schema_extra={"hint": "只填群号纯数字，例如 123456789；改完需要重载插件才生效"},
+        json_schema_extra={"hint": "只填群号纯数字，例如 123456789。由发码工具在每次调用时实时读取，改完立即生效，无需重载插件。"},
     )
     admin_whitelist: list[str] = Field(
         default_factory=list,
         description="允许发放兑换码的管理员 QQ 号。",
-        json_schema_extra={"hint": "只有这些 QQ 号能触发兑换码发放；其他人一律回绝"},
+        json_schema_extra={"hint": "只有这些 QQ 号能触发兑换码发放；其他人一律回绝。同样改完立即生效，无需重载。"},
     )
 
 
