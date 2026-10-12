@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import random
@@ -135,7 +136,17 @@ class RedeemPoolConfig(PluginConfigBase):
     used_codes: list[str] = Field(
         default_factory=list,
         description=f"已使用的兑换码记录（插件自动维护，最多保留 {MAX_USED_RECORDS} 条，最新在前）。",
-        json_schema_extra={"hint": "由插件在发放时自动写入，包含使用时间、群号和领取人；手动删除条目不影响已发出去的兑换码。"},
+        json_schema_extra={"hint": "由插件在发放时自动写入，包含使用时间、群号和领取人；手动删除条目不会让该兑换码回到待发放池。"},
+    )
+    issued_code_hashes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "已发放过的兑换码哈希（插件自动维护，不随上面的展示记录裁剪）。"
+            "用于在配置页陈旧保存、把已发出的码写回待发放池时把它挡住。"
+        ),
+        json_schema_extra={
+            "hint": "自动维护，请勿手改。每条为 sha256 前 16 位十六进制，不含兑换码明文。"
+        },
     )
 
 
@@ -186,8 +197,12 @@ class ToolConfig(PluginConfigBase):
         json_schema_extra={"hint": "越大越稳，但查询稍慢；一般 10 足够"},
     )
     speaker_ttl_seconds: int = Field(
-        default=300,
-        description="内存里记住的「最近发言人」有效期（秒），超时后改用数据库确认身份。",
+        default=90,
+        description="内存里记住的「最近发言人」有效期（秒），超时后改用数据库确认身份。"
+        "内存记录是身份判定的第一路径，且不经过时间窗校验——它的可信度完全依赖于"
+        "「记录发生在本次请求之前」这一时序。把它收得和 identity_fallback_window_seconds"
+        "同量级，可以限制时序万一变化时的影响范围：超时后就会落到带时间窗的数据库兜底。",
+        json_schema_extra={"hint": "建议与下面的兜底时间窗保持同量级；默认 90 秒"},
     )
     identity_fallback_window_seconds: int = Field(
         default=90,
@@ -207,6 +222,23 @@ class RedeemCodeConfig(PluginConfigBase):
     pool: RedeemPoolConfig = Field(default_factory=RedeemPoolConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
     tool: ToolConfig = Field(default_factory=ToolConfig)
+
+
+def _code_hash(code: str) -> str:
+    """计算兑换码的短哈希，用于「已发放过」判定。
+
+    标记集合会随发放次数长期增长并落盘，因此存哈希而非明文：既避免在配置文件里
+    额外堆积一份兑换码明文，也不受兑换码自身字符（``|``、``:``、换行等）影响。
+    取 sha256 前 16 位十六进制，够用且短。
+
+    Args:
+        code: 兑换码原文。
+
+    Returns:
+        str: 16 位十六进制哈希。
+    """
+
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
 
 
 def parse_code_lines(raw_text: str) -> List[str]:
@@ -253,6 +285,11 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         # 兑换码池的内存权威副本，与 config.toml 保持同步。
         self._available_codes: List[str] = []
         self._used_records: List[str] = []
+        # 已发放过的兑换码哈希集合（**不随展示记录裁剪**），单调保护靠它判定。
+        # 展示用的 _used_records 只保留最近 MAX_USED_RECORDS 条，被裁掉的那些码
+        # 若只从记录里推断就认不出来了，因此单独维护一份不裁剪的集合，并落盘保存。
+        # 存哈希而非明文：这份集合会长期增长，且不需要还原出原码。
+        self._issued_hashes: set[str] = set()
         # 记录本插件最后一次写回 config.toml 的兑换码池文本，
         # 用于区分「自己写回触发的回调」与「用户在配置页改的」。
         self._last_written_codes_text: Optional[str] = None
@@ -283,6 +320,14 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         hint_line = self._build_trigger_hint()
         expose_status = bool(self.config.tool.expose_status_tool)
 
+        # 这一路依赖 SDK 组件字典的键名（type / name / metadata / chat_scope），
+        # 宿主若改键名，群聊限定与激发信号注入会静默失效。真正兜底的是「群白名单
+        # 在调用时校验 + 拿不到 group_id 就拒绝」，因此失效也不会误发码，最坏表现
+        # 是「私聊里也能看见这个工具」。这里统计一下实际改写到的组件数，数量为 0
+        # 时给出提示，免得那种退化悄无声息。
+        touched = 0
+        synced_tool_count = 0
+
         # 深拷贝后再改：super().get_components() 返回的结构可能被 SDK 缓存复用，
         # 就地改写会污染 SDK 侧的状态（也可能影响其他插件看到的同一份对象）。
         result: List[Dict[str, Any]] = []
@@ -292,6 +337,7 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
                 continue
             item = copy.deepcopy(component)
             if item.get("type") == "TOOL":
+                synced_tool_count += 1
                 # 关掉余量查询时直接把组件摘掉，而不是留着它「调用即报错」：
                 # 挂着一个永远失败的工具会白占大模型的工具列表，也可能诱导它去调。
                 # 注意这属于注册期行为，改动后需重载插件才生效。
@@ -299,12 +345,25 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
                     del item
                     continue
                 item["chat_scope"] = "group"
+                touched += 1
                 if hint_line and item.get("name") == "redeem_code_issue":
                     metadata = item.get("metadata")
                     if isinstance(metadata, dict):
                         base = str(metadata.get("description") or "")
                         metadata["description"] = f"{base}\n{hint_line}" if base else hint_line
             result.append(item)
+
+        if hint_line and synced_tool_count == 0:
+            logger.warning(
+                "没有匹配到任何 TOOL 组件：激发信号未能注入到工具描述里。"
+                "可能是宿主的组件结构发生了变化，请检查 get_components 里依赖的键名。"
+            )
+        elif synced_tool_count and touched == 0:
+            logger.warning(
+                "匹配到 %d 个 TOOL 组件但没有一个被加上 chat_scope："
+                "宿主的组件结构可能已变化，群聊限定可能失效。",
+                synced_tool_count,
+            )
         return result
 
     def _build_trigger_hint(self) -> str:
@@ -336,6 +395,22 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
             len(self._used_records),
         )
 
+        # 内存身份路径不经过时间窗校验，其正确性依赖「chat.receive.after_process
+        # 在本次工具调用之前触发」这一时序。该时序在当前宿主版本成立（bot.py 中
+        # 钩子在 register_message 之前），但它不是宿主承诺的契约。内存窗口一旦
+        # 明显宽于兜底时间窗，时序万一变化就会静默退化成「窗口期内最后说过话的人」。
+        # 这里在装载时做一次低成本提示，避免那种退化悄无声息。
+        ttl = max(int(self.config.tool.speaker_ttl_seconds), 1)
+        window = int(self.config.tool.identity_fallback_window_seconds)
+        if window > 0 and ttl > window * 3:
+            logger.warning(
+                "内存身份窗口（%d 秒）远宽于兜底时间窗（%d 秒）：内存路径不经过时间窗校验，"
+                "若宿主调整了 chat.receive.after_process 的触发时序，身份判定会比带校验的"
+                "兜底路径更松。建议把 speaker_ttl_seconds 收敛到与兜底同量级。",
+                ttl,
+                window,
+            )
+
     async def on_unload(self) -> None:
         """卸载时无需额外清理，兑换码池已实时落盘。"""
 
@@ -359,14 +434,22 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
 
         pool = config_data.get("pool")
         incoming_text = ""
+        incoming_records: List[str] = []
         if isinstance(pool, dict):
             raw_available = pool.get("available_codes")
             incoming_text = "" if raw_available is None else str(raw_available)
+            raw_records = pool.get("used_codes")
+            if isinstance(raw_records, (list, tuple)):
+                incoming_records = [str(item).strip() for item in raw_records if str(item).strip()]
 
         # 自己写回引发的回声：内存状态已经是最新的，跳过重新装载，
         # 避免把刚发放的兑换码重新算回未使用。
+        # 注意这里同时比对 used_codes，而不只是 available_codes：只比对后者的话，
+        # 当池子恰好没变化（例如只剩 0 个码时又发了一次），一次「只改了 used_codes」
+        # 的真实配置更新会被误判成回声而跳过。
         if self._last_written_codes_text is not None and incoming_text == self._last_written_codes_text:
-            return
+            if incoming_records == self._used_records:
+                return
 
         self._reload_pool_from_config()
         logger.info(
@@ -612,8 +695,13 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         保护规则有两条：
         1. 已使用记录**只增不减**：新配置里的记录与内存里的求并集，绝不因为一次
            陈旧保存而丢掉发放历史；
-        2. 待发放池**剔除**所有已出现在已使用记录里的码（含本次并集进来的），
-           因此即使旧模型把码写回了 ``available_codes``，它也复活不了。
+        2. 待发放池**剔除**所有已发放过的码，因此即使旧模型把码写回了
+           ``available_codes``，它也复活不了。
+
+        第 2 条依据的是 ``_issued_codes`` 这个**不随展示记录裁剪**的集合：
+        展示用的 ``_used_records`` 只保留最近 ``MAX_USED_RECORDS`` 条，若只从它
+        推断已发码，被裁掉的那些码就脱离了保护，陈旧保存时仍能复活。因此集合在
+        装载时把「配置里的记录」与「上一轮的集合」都并进来，只增不减。
 
         代价是：管理员在配置页里**手动删掉**某条已使用记录并不会让那个码回到
         待发放池。这是有意的——「一个码只发一次」比「能手工回收」更重要。
@@ -630,9 +718,13 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if len(merged_records) > MAX_USED_RECORDS:
             del merged_records[MAX_USED_RECORDS:]
 
-        used_codes = self._collect_used_codes(merged_records)
-        resurrected = [code for code in incoming_codes if code in used_codes]
-        available = [code for code in incoming_codes if code not in used_codes]
+        # 已发码集合只增不减：持久化的哈希 + 上一轮集合 + 仍在记录里的 + 被裁掉的历史。
+        self._issued_hashes |= {str(item).strip() for item in self.config.pool.issued_code_hashes if str(item).strip()}
+        self._issued_hashes |= {_code_hash(code) for code in self._collect_used_codes(incoming_records)}
+        self._issued_hashes |= {_code_hash(code) for code in self._collect_used_codes(merged_records)}
+
+        resurrected = [code for code in incoming_codes if _code_hash(code) in self._issued_hashes]
+        available = [code for code in incoming_codes if _code_hash(code) not in self._issued_hashes]
 
         self._available_codes = available
         self._used_records = merged_records
@@ -683,6 +775,13 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         取码与写盘在同一段同步逻辑里完成，期间没有 await，因此并发触发时
         不会把同一个兑换码发两次。
 
+        关于「在事件循环里做同步写盘」：这是有意为之。把这个方法丢进线程池可以让出
+        事件循环，但那样「取码 → 写盘 → 失败回滚」就不再是不可分割的一步，两个并发
+        请求可能交错地取到同一个码，而「一个码只发一次」正是本插件的核心不变量。
+        配置文件很小（一次读 + 一次写，量级在几十 KB 以内），发码又是低频操作，
+        阻塞可忽略；用异步换来的那点吞吐不值得拿正确性去赌。因此这里保持同步，
+        由 :data:`_CONFIG_WRITE_LOCK` 串行化写回。
+
         写盘成功才算发放成功。写盘失败时会把内存状态整体回滚到发放前的样子，
         并让调用方拒绝发放——否则磁盘上的 ``available_codes`` 仍含这个码，
         插件重载后会再发一次。
@@ -702,9 +801,11 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         # 记下发放前的状态，写盘失败时用于回滚。
         previous_codes = list(self._available_codes)
         previous_records = list(self._used_records)
+        previous_hashes = set(self._issued_hashes)
 
         index = random.randrange(len(self._available_codes))
         code = self._available_codes.pop(index)
+        self._issued_hashes.add(_code_hash(code))
         self._used_records.insert(0, self._format_used_record(code, group_id, user_id))
         # 只保留最近 MAX_USED_RECORDS 条，避免配置文件无限膨胀。
         if len(self._used_records) > MAX_USED_RECORDS:
@@ -713,6 +814,7 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         if not self._persist_pool():
             self._available_codes = previous_codes
             self._used_records = previous_records
+            self._issued_hashes = previous_hashes
             return None, len(self._available_codes), False
 
         return code, len(self._available_codes), True
@@ -766,6 +868,9 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
                     document["pool"] = pool_table
                 pool_table["available_codes"] = codes_text
                 pool_table["used_codes"] = list(self._used_records)
+                # 已发码哈希集合也落盘，否则插件重载后这份保护就丢了——
+                # 而恰恰是「重载 + 配置页陈旧保存」的组合能复活已发出的码。
+                pool_table["issued_code_hashes"] = sorted(self._issued_hashes)
 
                 with open(config_path, "w", encoding="utf-8") as handle:
                     handle.write(tomlkit.dumps(document))
