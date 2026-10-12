@@ -58,6 +58,10 @@ git clone https://github.com/houlong5071/redeem-code-distributor.git
 
 第 2 条的时间窗是必须的：群里的「最后一条消息」未必就是本次请求者。如果管理员刚说过话而内存记录又恰好失效，紧接着旁边的非管理员说一句「发个兑换码」，不加时间窗就会把他认成管理员而发码。现在最后一条消息不够新、或时间戳缺失/不可读，都会**保守拒绝**。把 `identity_fallback_window_seconds` 设为 `0` 可完全禁用兜底，身份只认内存记录。
 
+第 2 条查询时显式传了 `filter_mai=True`，把麦麦自己发的消息排除在外——宿主该参数默认为 `False`，不排除的话，麦麦刚回复过就会把自己认成「最后发言人」，而它的 QQ 不在白名单里，兜底会稳定失败。
+
+**关于钩子时机**：内存记录由 `chat.receive.after_process` 维护。该钩子在 `src/chat/message_receive/bot.py` 中于 `chat_manager.register_message()` **之前**触发（第 812 行 vs 第 841 行），而工具调用发生在其后的 `heartflow_message_receiver.process_message()` 链路里。因此发码工具被调用时，内存里的「最近发言人」就是刚说话的这个人，不存在读到过期发言人的问题。
+
 两条路都拿不到身份时会**保守拒绝**，而不是放行。
 
 发码工具与余量查询工具走的是**同一套校验**（身份 → 群白名单 → 管理员白名单）。

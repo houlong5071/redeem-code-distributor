@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import random
 import threading
@@ -47,6 +48,9 @@ CONFIG_FILENAME = "config.toml"
 
 # 已使用记录在配置页展示时保留的最大条数，超出后丢弃最旧的记录。
 MAX_USED_RECORDS = 1000
+
+# 「最近发言人」内存记录的最大会话数，超出后淘汰最旧的，避免长期运行下无限增长。
+MAX_RECENT_SPEAKERS = 512
 
 # 同进程内串行化「读改写 config.toml」，避免并发触发时互相覆盖。
 _CONFIG_WRITE_LOCK = threading.Lock()
@@ -267,16 +271,23 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
         components = super().get_components()
         hint_line = self._build_trigger_hint()
 
+        # 深拷贝后再改：super().get_components() 返回的结构可能被 SDK 缓存复用，
+        # 就地改写会污染 SDK 侧的状态（也可能影响其他插件看到的同一份对象）。
+        result: List[Dict[str, Any]] = []
         for component in components:
-            if component.get("type") != "TOOL":
+            if not isinstance(component, dict):
+                result.append(component)
                 continue
-            component["chat_scope"] = "group"
-            if hint_line and component.get("name") == "redeem_code_issue":
-                metadata = component.get("metadata")
-                if isinstance(metadata, dict):
-                    base = str(metadata.get("description") or "")
-                    metadata["description"] = f"{base}\n{hint_line}" if base else hint_line
-        return components
+            item = copy.deepcopy(component)
+            if item.get("type") == "TOOL":
+                item["chat_scope"] = "group"
+                if hint_line and item.get("name") == "redeem_code_issue":
+                    metadata = item.get("metadata")
+                    if isinstance(metadata, dict):
+                        base = str(metadata.get("description") or "")
+                        metadata["description"] = f"{base}\n{hint_line}" if base else hint_line
+            result.append(item)
+        return result
 
     def _build_trigger_hint(self) -> str:
         """把配置里的激发信号拼成给大模型的提示语。
@@ -389,9 +400,31 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
             if not user_id or not group_id:
                 return {"action": "continue"}
             self._recent_speakers[session_id] = (group_id, user_id, time.monotonic())
+            self._prune_recent_speakers()
         except Exception:
             logger.debug("记录最近发言人失败", exc_info=True)
         return {"action": "continue"}
+
+    def _prune_recent_speakers(self) -> None:
+        """给「最近发言人」记录做上限保护，避免这个字典随会话数无限增长。
+
+        一个长期运行的实例会见过任意多个会话，如果只在读取时惰性删除，没被再次
+        查询的会话就会一直留在内存里。这里在写入路径上顺手清理：先删掉已过期的，
+        若仍然超限，再按记录时刻淘汰最旧的那些。
+        """
+
+        if len(self._recent_speakers) <= MAX_RECENT_SPEAKERS:
+            return
+        ttl = max(int(self.config.tool.speaker_ttl_seconds), 1)
+        now = time.monotonic()
+        for key in [key for key, record in self._recent_speakers.items() if now - record[2] > ttl]:
+            self._recent_speakers.pop(key, None)
+
+        overflow = len(self._recent_speakers) - MAX_RECENT_SPEAKERS
+        if overflow > 0:
+            oldest = sorted(self._recent_speakers.items(), key=lambda kv: kv[1][2])[:overflow]
+            for key, _ in oldest:
+                self._recent_speakers.pop(key, None)
 
     def _load_recent_speaker(self, session_id: str) -> Optional[Tuple[str, str]]:
         """从内存记录里取出最近发言人，过期则忽略。
@@ -449,7 +482,18 @@ class RedeemCodeDistributorPlugin(MaiBotPlugin):
 
         try:
             limit = max(int(self.config.tool.recent_message_limit), 1)
-            recent = await self.ctx.message.get_recent(session_id, limit=limit)
+            # filter_mai=True：把麦麦自己发的消息排除掉。宿主该参数的默认值是把
+            # 麦麦自己的消息也算进来的，而兜底逻辑取的是「最后一条消息的发送者」——
+            # 麦麦刚回复过的话，取到的就是麦麦自己（其 QQ 不在管理员白名单里），
+            # 于是兜底会稳定地失败、形同虚设。显式过滤掉才是「谁在跟麦麦说话」。
+            recent = await self.ctx.message.get_recent(session_id, limit=limit, filter_mai=True)
+        except TypeError:
+            # 宿主/ SDK 版本不支持该参数时退回不传，行为与旧版一致。
+            try:
+                recent = await self.ctx.message.get_recent(session_id, limit=limit)
+            except Exception:
+                logger.error("查询最近消息失败，无法确认请求者: session_id=%s", session_id, exc_info=True)
+                return None
         except Exception:
             logger.error("查询最近消息失败，无法确认请求者: session_id=%s", session_id, exc_info=True)
             return None
